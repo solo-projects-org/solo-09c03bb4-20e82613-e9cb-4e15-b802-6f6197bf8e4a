@@ -9,8 +9,9 @@
   4. 同内容跨接收去重，磁盘只一份、额度只算一次
   5. 错误长度/摘要/Parquet 内容拒绝且无成品
   6. 慢上传期间另一实例仍可接收与查询（不阻塞）
-  7. 配额不足 507
-  8. 崩溃回收：伪造孤儿暂存后调 /admin/reconcile 被清理
+  7. 崩溃回收：伪造孤儿暂存后调 /admin/reconcile 被清理
+  8. 保留期策略跨实例共享、过期清退返回实际接收号、未配置站点不清退、重复清退幂等
+  9. 已发布数据最终完整性
 """
 
 from __future__ import annotations
@@ -220,7 +221,65 @@ def main() -> int:
     check("对账清理孤儿暂存", code == 200 and info["removed_staging_files"] >= 1
           and not staging.exists(), str(info))
 
-    print("== 8. 已发布数据最终完整性 ==")
+    print("== 8. 保留期设置与过期清退（跨实例） ==")
+    today = dt.datetime.now(dt.timezone.utc).date()
+    old_day = today - dt.timedelta(days=30)
+    # 实例1 设置保留策略；实例2 查询可见
+    code, body, _ = req("PUT", BASE1, "/retention/BUOY-RET", {"retain_days": 7})
+    check("实例1 设置保留策略 200", code == 200
+          and json.loads(body)["retain_days"] == 7, body[:160].decode())
+    code, body, _ = req("GET", BASE2, "/retention/BUOY-RET")
+    check("实例2 查询同一策略", code == 200
+          and json.loads(body)["retain_days"] == 7)
+
+    # 过期包（观测日 30 天前）与保留期内包（观测日今天）分别经不同实例入湖
+    d_old, sha_old = make_parquet("pret-old.parquet", station="BUOY-RET",
+                                  day=old_day, salt=7.0)
+    d_new, sha_new = make_parquet("pret-new.parquet", station="BUOY-RET",
+                                  day=today, salt=8.0)
+    d_np, sha_np = make_parquet("pret-np.parquet", station="BUOY-NOPOLICY",
+                                day=old_day, salt=9.0)
+    req("PUT", BASE2, "/receipts/IT-RET-OLD/declaration",
+        decl("IT-RET-OLD", d_old, sha_old, station_id="BUOY-RET",
+             obs_date=old_day.isoformat()))
+    req("POST", BASE2, "/receipts/IT-RET-OLD/content", d_old, raw=True)
+    req("PUT", BASE1, "/receipts/IT-RET-NEW/declaration",
+        decl("IT-RET-NEW", d_new, sha_new, station_id="BUOY-RET",
+             obs_date=today.isoformat()))
+    req("POST", BASE1, "/receipts/IT-RET-NEW/content", d_new, raw=True)
+    req("PUT", BASE2, "/receipts/IT-RET-NP/declaration",
+        decl("IT-RET-NP", d_np, sha_np, station_id="BUOY-NOPOLICY",
+             obs_date=old_day.isoformat()))
+    req("POST", BASE2, "/receipts/IT-RET-NP/content", d_np, raw=True)
+
+    q_before = json.loads(req("GET", BASE1, "/quota")[1])
+    code, body, _ = req("POST", BASE2, "/admin/purge")
+    info = json.loads(body)
+    check("清退返回实际接收号", code == 200
+          and info["purged_receipts"] == ["IT-RET-OLD"], str(info)[:200])
+    check("清退基准日为 UTC 当天", info["purge_date"] == today.isoformat())
+    q_after = json.loads(req("GET", BASE1, "/quota")[1])
+    check("额度按实际清退腾出",
+          q_before["used_bytes"] - q_after["used_bytes"]
+          == info["freed_bytes_total"] == len(d_old),
+          f'{q_before["used_bytes"]} -> {q_after["used_bytes"]}')
+
+    code, _, _ = req("GET", BASE1, "/receipts/IT-RET-OLD")
+    check("过期接收登记已删除", code == 404)
+    code, body, _ = req("GET", BASE1, "/receipts/IT-RET-NEW/download")
+    check("保留期内接收仍可下载", code == 200 and body == d_new)
+    code, body, _ = req("GET", BASE2, "/receipts/IT-RET-NP/download")
+    check("未配置站点不清退", code == 200 and body == d_np)
+
+    code, body, _ = req("POST", BASE1, "/admin/purge")
+    info = json.loads(body)
+    check("重复清退幂等（不重复回收额度）", code == 200
+          and info["purged_count"] == 0 and info["freed_bytes_total"] == 0,
+          str(info)[:200])
+    q_again = json.loads(req("GET", BASE2, "/quota")[1])
+    check("重复清退后额度不变", q_again["used_bytes"] == q_after["used_bytes"])
+
+    print("== 9. 已发布数据最终完整性 ==")
     code, body, _ = req("GET", BASE1, "/receipts", )
     states = {r["receipt_id"]: r["state"] for r in json.loads(body)}
     check("成功记录均为 PUBLISHED",

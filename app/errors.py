@@ -56,3 +56,8 @@ class InvalidPackage(ObsError):
 class AlreadyFinalized(ObsError):
     status_code = 409
     code = "already_finalized"
+
+
+class RetentionPolicyNotFound(ObsError):
+    status_code = 404
+    code = "retention_policy_not_found"

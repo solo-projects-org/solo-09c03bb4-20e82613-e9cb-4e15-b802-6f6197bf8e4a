@@ -15,7 +15,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS receipts (
@@ -48,6 +48,13 @@ CREATE TABLE IF NOT EXISTS blobs (
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- 按站点保留期策略：retain_days 为保留天数；未配置（无行）的站点永不清退
+CREATE TABLE IF NOT EXISTS retention_policies (
+    station_id  TEXT PRIMARY KEY,
+    retain_days INTEGER NOT NULL CHECK (retain_days >= 0),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 """
 
@@ -88,10 +95,18 @@ class Database:
                     "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(row["value"]) != SCHEMA_VERSION:  # pragma: no cover - 迁移预留
-                raise RuntimeError(
-                    f"数据库 schema 版本 {row['value']} 与程序 {SCHEMA_VERSION} 不兼容"
-                )
+            else:
+                version = int(row["value"])
+                if version > SCHEMA_VERSION:  # pragma: no cover - 防御性
+                    raise RuntimeError(
+                        f"数据库 schema 版本 {version} 高于程序支持的 {SCHEMA_VERSION}"
+                    )
+                if version < SCHEMA_VERSION:
+                    # 增量迁移：_SCHEMA 全部为 IF NOT EXISTS，老库重放即补齐新表
+                    self._conn.execute(
+                        "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+                        (str(SCHEMA_VERSION),),
+                    )
 
     @contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:

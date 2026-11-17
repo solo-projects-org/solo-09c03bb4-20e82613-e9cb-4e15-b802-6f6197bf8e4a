@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 
-from fastapi import BackgroundTasks, FastAPI, Query, Request, status
+from fastapi import BackgroundTasks, FastAPI, Path, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
@@ -18,11 +18,21 @@ from . import __version__
 from .config import Settings, load_settings
 from .db import Database
 from .errors import ObsError
+from .retention import (
+    delete_retention,
+    get_retention,
+    list_retentions,
+    purge_expired,
+    set_retention,
+)
 from .schemas import (
     DeclarationIn,
+    PurgeResultOut,
     QuotaOut,
     ReceiptOut,
     ReconcileOut,
+    RetentionPolicyIn,
+    RetentionPolicyOut,
     UploadResult,
 )
 from .service import (
@@ -84,7 +94,9 @@ app = FastAPI(
         "- 同号同声明重试沿用原记录，异声明拒绝（409）；\n"
         "- 相同内容跨接收只存一份（内容寻址），不重复占额；\n"
         "- 空间不足返回 507；校验失败无可下载成品；\n"
-        "- 双实例共享存储，崩溃残留由启动与周期对账自动回收。"
+        "- 双实例共享存储，崩溃残留由启动与周期对账自动回收；\n"
+        "- 按站点配置保留天数，`POST /admin/purge` 以 UTC 当天为基准清退\n"
+        "  观测日早于 当天-保留天数 的已发布接收，未配置站点不清退。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -249,3 +261,69 @@ async def quota() -> QuotaOut:
 async def trigger_reconcile(background: BackgroundTasks) -> ReconcileOut:
     result = await _offload(reconcile, settings, db)
     return ReconcileOut(**result)
+
+
+# ---------------------------------------------------------------- 保留与清退
+
+
+@app.put(
+    "/retention/{station_id}",
+    response_model=RetentionPolicyOut,
+    tags=["保留与清退"],
+    summary="设置站点保留天数（upsert，同站重复设置幂等）",
+)
+async def put_retention(
+    body: RetentionPolicyIn,
+    station_id: str = Path(min_length=1, max_length=64),
+) -> RetentionPolicyOut:
+    row = await _offload(set_retention, db, station_id, body.retain_days)
+    return RetentionPolicyOut(**row)
+
+
+@app.get(
+    "/retention",
+    response_model=list[RetentionPolicyOut],
+    tags=["保留与清退"],
+    summary="列出全部站点保留策略",
+)
+async def list_all_retentions() -> list[RetentionPolicyOut]:
+    rows = await _offload(list_retentions, db)
+    return [RetentionPolicyOut(**r) for r in rows]
+
+
+@app.get(
+    "/retention/{station_id}",
+    response_model=RetentionPolicyOut,
+    tags=["保留与清退"],
+    summary="查询单个站点保留策略（未配置 404）",
+)
+async def show_retention(
+    station_id: str = Path(min_length=1, max_length=64),
+) -> RetentionPolicyOut:
+    row = await _offload(get_retention, db, station_id)
+    return RetentionPolicyOut(**row)
+
+
+@app.delete(
+    "/retention/{station_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=JSONResponse,
+    tags=["保留与清退"],
+    summary="删除站点保留策略（删除后该站点不再清退）",
+)
+async def remove_retention(station_id: str = Path(min_length=1, max_length=64)):
+    await _offload(delete_retention, db, station_id)
+    return JSONResponse(status_code=status.HTTP_204_NO_CONTENT, content=None)
+
+
+@app.post(
+    "/admin/purge",
+    response_model=PurgeResultOut,
+    tags=["保留与清退"],
+    summary="按保留策略清退过期已发布接收（可 ?station_id= 限定单站）",
+)
+async def purge(
+    station_id: str | None = Query(None, min_length=1, max_length=64),
+) -> PurgeResultOut:
+    result = await _offload(purge_expired, settings, db, station_id=station_id)
+    return PurgeResultOut(**result)
